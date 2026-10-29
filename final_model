@@ -1,0 +1,67 @@
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import numpy as np
+import argparse
+parser = argparse.ArgumentParser()
+args = parser.parse_args(args=[])
+args.device = 'cuda'
+if torch.cuda.is_available():
+    args.device = 'cuda:0'
+
+
+class GradientReversal(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, alpha=1.0):
+        ctx.alpha = alpha
+        return x.view_as(x)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        return grad_output.neg() * ctx.alpha, None
+
+
+class GradientReversalLayer(nn.Module):
+
+    def __init__(self, alpha=1.0):
+        super().__init__()
+        self.alpha = alpha
+
+    def forward(self, x):
+        return GradientReversal.apply(x, self.alpha)
+
+class LearnableLatentVAE(nn.Module):
+    def __init__(self, pretrained_vae):
+        super().__init__()
+        self.vae = pretrained_vae
+        self.freeze_vae()
+
+        self.learnable_eps = nn.Parameter(torch.zeros(20, 2))
+        self.grad_reverse = GradientReversalLayer(alpha=0.8)
+
+    def freeze_vae(self):
+        for param in self.vae.parameters():
+            param.requires_grad = False
+
+    def forward(self, x, use_perturbation):
+        h = self.vae.encoder(x)
+        mu = self.vae.fc_mu(h)
+        logvar = self.vae.fc_logvar(h)
+
+        dynamics = torch.sigmoid(self.vae.dynamics(h))
+
+        std = torch.exp(0.5 * logvar)
+
+        if use_perturbation:
+            eps = self.learnable_eps.to(args.device)
+            perturbed_eps = self.grad_reverse(eps)
+            sample = mu + perturbed_eps * std
+        else:
+            perturbed_eps = torch.randn_like(std).to(args.device)
+            sample = mu + perturbed_eps * std
+
+        z = torch.cat([dynamics, sample], dim=1)
+
+        reconstructed = self.vae.decode(z)
+
+        return reconstructed, perturbed_eps
