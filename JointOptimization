@@ -1,0 +1,217 @@
+import torch
+import os
+import random
+import numpy as np
+import scipy
+import torch.nn.functional as F
+from torch import nn
+import scipy.io as scio
+from torch.utils.data import random_split, TensorDataset, DataLoader
+import argparse
+from final_model import LearnableLatentVAE
+from final_classifier import Classifier
+
+parser = argparse.ArgumentParser()
+parser.add_argument('--lr', type=float, default=0.001, help='learning rate')
+parser.add_argument('--weight_decay', type=float, default=0.0001, help='weight decay')
+parser.add_argument('--epochs', type=int, default=100, help='maximum number of epochs')
+parser.add_argument('--batch_size', type=int, default=20, help='batch size')
+parser.add_argument('--patience', type=int, default=50, help='patience for earlystopping')
+
+args = parser.parse_args(args=[])
+args.device = 'cuda' if torch.cuda.is_available() else 'cpu'
+print(f"Using device: {args.device}")
+
+
+def fft_normalize(data, norm='ortho'):
+    """
+    Normalization of frequency spectrum
+
+    Args:
+        data: torch.Tensor
+        norm: 'ortho' or 'backward'
+
+    Returns:
+        magnitude_norm: torch.Tensor
+    """
+    fft_result = torch.fft.rfft(data, dim=1, norm=norm)
+
+    magnitude = torch.abs(fft_result)
+
+    min_vals = magnitude.min(dim=1, keepdim=True)[0] 
+    max_vals = magnitude.max(dim=1, keepdim=True)[0] 
+
+    range_vals = max_vals - min_vals
+    range_vals = torch.where(range_vals == 0, torch.ones_like(range_vals), range_vals)
+
+    magnitude_norm = (magnitude - min_vals) / range_vals 
+
+    return magnitude_norm
+
+
+def evaluate_model(model_cls, test_loader, device):
+    """
+    Evaluate the model on test dataset
+    """
+    model_cls.eval()
+    correct = 0
+    total = 0
+    all_preds = []
+    all_labels = []
+
+    with torch.no_grad():
+        for data, labels in test_loader:
+            data = data.to(device)
+            labels = labels.to(device)
+
+            outputs, feature = model_cls(data)
+            _, predicted = torch.max(outputs, 1)
+            correct += (predicted == labels.squeeze(1)).sum().item()
+            total += labels.size(0)
+
+            outputs = outputs.cpu().detach()
+            all_preds.extend(predicted.cpu().numpy())
+            all_labels.extend(labels.cpu().numpy())
+
+    accuracy = 100 * correct / total
+    return accuracy, all_preds, all_labels, outputs, feature
+
+
+
+for count in range(1):
+      N = scio.loadmat('N700.mat')
+      N = np.array(N['N700'])
+      N = torch.from_numpy(N).float()
+      N_train_dataset = TensorDataset(N)
+      N_train_loader = DataLoader(N_train_dataset, batch_size=args.batch_size, shuffle=True)
+
+      IF = scio.loadmat('IF700_CLS.mat')
+      IF = np.array(IF['IF700_CLS'])
+      IF = torch.from_numpy(IF).float()
+      IF_train_dataset = TensorDataset(IF)
+      IF_train_loader = DataLoader(IF_train_dataset, batch_size=args.batch_size, shuffle=True)
+
+      OF = scio.loadmat('OF700_CLS.mat')
+      OF = np.array(OF['OF700_CLS'])
+      OF = torch.from_numpy(OF).float()
+      OF_train_dataset = TensorDataset(OF)
+      OF_train_loader = DataLoader(OF_train_dataset, batch_size=args.batch_size, shuffle=True)
+
+      test_data = scio.loadmat('test_data.mat')
+      test_data = np.array(test_data['test_data'])
+      test_data = torch.from_numpy(test_data).float()
+      test_data = fft_normalize(test_data)
+
+      test_label = scio.loadmat('test_label.mat')
+      test_label = np.array(test_label['test_label'])
+      test_label = torch.from_numpy(test_label).long()
+
+      test_dataset = TensorDataset(test_data, test_label)
+      test_loader = DataLoader(test_dataset, batch_size=len(test_dataset), shuffle=False)
+
+      IF_model = torch.load('IF_model.pth', weights_only=False)
+      IF_model.eval()
+
+      OF_model = torch.load('OF_model.pth', weights_only=False)
+      OF_model.eval()
+
+      model_IF = LearnableLatentVAE(IF_model)
+      model_OF = LearnableLatentVAE(OF_model)
+
+      for model in [model_IF, model_OF]:
+          model.freeze_vae()
+
+      model_cls = Classifier(args).to(args.device)
+
+      learnable_params = [model_IF.learnable_eps, model_OF.learnable_eps]
+      optimizer_learnable = torch.optim.Adam(learnable_params, lr=0.0002)
+
+      classifier_params = list(model_cls.parameters())
+      optimizer_classifier = torch.optim.Adam(classifier_params, lr=0.001)
+
+      for epoch in range(args.epochs):
+          model_IF.train()
+          model_OF.train()
+          model_cls.train()
+
+          normal_iter = iter(N_train_loader)
+          if_iter = iter(IF_train_loader)
+          of_iter = iter(OF_train_loader)
+
+          alpha = 1
+          for model in [model_IF, model_OF]:
+              if hasattr(model, 'grad_reverse'):
+                  model.grad_reverse.alpha = alpha
+
+          for batch_idx in range(5):
+              normal_data = next(normal_iter)[0]
+              if_data = next(if_iter)[0]
+              of_data = next(of_iter)[0]
+
+              normal_data = normal_data.to(args.device)
+              if_data = if_data.to(args.device)
+              of_data = of_data.to(args.device)
+
+              labels_n = torch.zeros(args.batch_size, dtype=torch.long).to(args.device)
+              labels_if = torch.ones(args.batch_size, dtype=torch.long).to(args.device)
+              labels_of = torch.full((args.batch_size,), 2, dtype=torch.long).to(args.device)
+
+              #
+              optimizer_classifier.zero_grad()
+              #---------------------------N----------------------------------#
+              output_n, feature_ori_N = model_cls(fft_normalize(normal_data))
+              loss_n = F.cross_entropy(output_n, labels_n)
+              recon_if, _ = model_IF(if_data, use_perturbation=True)
+              signal_IF = recon_if
+              recon_if = fft_normalize(recon_if)
+              total_ori_feature_N.append(feature_ori_N.cpu().detach())
+              # ---------------------------IF---------------------------------#
+              output_if_ori, feature_ori_IF = model_cls(fft_normalize(if_data))
+              output_if, feature_IF = model_cls(recon_if)
+              weight_if = (1 - F.cosine_similarity(output_if, output_if_ori, dim=1)) * (-torch.sum(output_if * torch.log(output_if+1e-6), dim=1))
+              loss_if_ori = F.cross_entropy(output_if_ori, labels_if)
+              loss_if = F.cross_entropy(output_if, labels_if, reduction='none')
+              loss_if = (weight_if * loss_if).sum() / args.batch_size
+
+              total_ori_feature_IF.append(feature_ori_IF.cpu().detach())
+              total_feature_IF.append(feature_IF.cpu().detach())
+              total_weight_IF.append(weight_if.cpu().detach())
+              # ---------------------------OF---------------------------------#
+              recon_of, _ = model_OF(of_data, use_perturbation=True)
+              signal_OF = recon_of
+              recon_of = fft_normalize(recon_of)
+              output_of_ori, feature_ori_OF = model_cls(fft_normalize(of_data))
+              output_of, feature_OF = model_cls(recon_of)
+              weight_of = (1 - F.cosine_similarity(output_of, output_of_ori, dim=1)) * (-torch.sum(output_of * torch.log(output_of+1e-6), dim=1))
+              loss_of_ori = F.cross_entropy(output_of_ori, labels_of)
+              loss_of = F.cross_entropy(output_of, labels_of, reduction='none')
+              loss_of = (weight_of * loss_of).sum() / args.batch_size
+
+              loss_cls = loss_n + loss_if + loss_of + loss_if_ori + loss_of_ori
+
+
+              loss_cls.backward()
+              optimizer_classifier.step()
+
+              #
+              optimizer_learnable.zero_grad()
+              # ---------------------------IF---------------------------------#
+              recon_if_adv, perturbed_eps_if = model_IF(if_data, use_perturbation=True)
+              output_if_adv, _ = model_cls(fft_normalize(recon_if_adv))
+              loss_adv_if = F.cross_entropy(output_if_adv, labels_if)
+              # ---------------------------OF---------------------------------#
+              recon_of_adv,  perturbed_eps_of = model_OF(of_data, use_perturbation=True)
+              output_of_adv, _ = model_cls(fft_normalize(recon_of_adv))
+              loss_adv_of = F.cross_entropy(output_of_adv, labels_of)
+
+              loss_adv = loss_adv_if + loss_adv_of
+              loss_adv.backward()
+              optimizer_learnable.step()
+
+          test_accuracy, test_preds, test_labels, outputs, _ = evaluate_model(model_cls, test_loader, args.device)
+
+      print(test_accuracy)
+        
+
+
+
